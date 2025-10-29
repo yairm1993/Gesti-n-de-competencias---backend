@@ -7,7 +7,7 @@ const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 
 const app = express();
-const PORT = process.env.PORT || 3000; // ✅ Puerto dinámico para Render
+const PORT = process.env.PORT || 3000;
 
 // ===============================
 // 🧰 MIDDLEWARE
@@ -15,14 +15,19 @@ const PORT = process.env.PORT || 3000; // ✅ Puerto dinámico para Render
 app.use(cors());
 app.use(express.json());
 
-// ✅ Servir frontend (por si decides desplegar todo junto en un futuro)
+// Servir estáticos del Frontend si lo necesitas local
 app.use(express.static(path.join(__dirname, '..', 'Frontend')));
+
+app.get('/', (req, res) => {
+  // Si estás sirviendo frontend local:
+  // res.sendFile(path.join(__dirname, '..', 'Frontend', 'index.html'));
+  res.send('✅ Servidor activo y funcionando correctamente');
+});
 
 // ===============================
 // 📊 BASE DE DATOS
 // ===============================
-const dbPath = path.join(__dirname, 'database.db');
-const db = new sqlite3.Database(dbPath, (err) => {
+const db = new sqlite3.Database(path.join(__dirname, 'database.db'), (err) => {
   if (err) {
     console.error('❌ Error al conectar con la base de datos:', err.message);
   } else {
@@ -30,7 +35,7 @@ const db = new sqlite3.Database(dbPath, (err) => {
   }
 });
 
-// Crear tabla si no existe
+// Crear tabla si no existe (sin nuevas columnas aún)
 db.run(`
   CREATE TABLE IF NOT EXISTS vacantes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,11 +51,56 @@ db.run(`
   )
 `);
 
+// ➕ Migración segura de columnas nuevas: folio y fechaInicio
+function ensureColumn(table, column, definition) {
+  return new Promise((resolve, reject) => {
+    db.all(`PRAGMA table_info(${table});`, [], (err, rows) => {
+      if (err) return reject(err);
+      const exists = rows.some(r => r.name === column);
+      if (exists) return resolve('exists');
+      db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`, [], (err2) => {
+        if (err2) return reject(err2);
+        resolve('added');
+      });
+    });
+  });
+}
+
+(async () => {
+  try {
+    await ensureColumn('vacantes', 'folio', 'TEXT');
+    await ensureColumn('vacantes', 'fechaInicio', 'TEXT');
+    console.log('🔧 Migración de columnas completada (folio, fechaInicio)');
+  } catch (e) {
+    console.error('❌ Error migrando columnas:', e.message);
+  }
+})();
+
+// Helpers
+const pad4 = n => n.toString().padStart(4, '0');
+function hoyYYYYMMDD() {
+  // Fecha local de MX (si Render está en UTC, igual guardamos ISO simple)
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}${mm}${dd}`;
+}
+function hoyISODate() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
 // ===============================
 // 📥 OBTENER TODAS LAS VACANTES
 // ===============================
 app.get('/api/vacantes', (req, res) => {
-  db.all('SELECT * FROM vacantes ORDER BY id DESC', [], (err, rows) => {
+  db.all(`SELECT id, folio, nombre, area, requisitor, tipoProceso, tipo, prioridad, fechaInicio, comentarios, estatus
+          FROM vacantes
+          ORDER BY id DESC`, [], (err, rows) => {
     if (err) {
       console.error('❌ Error al listar vacantes:', err.message);
       return res.status(500).json({ error: 'Error al listar vacantes' });
@@ -63,20 +113,48 @@ app.get('/api/vacantes', (req, res) => {
 // 📨 CREAR VACANTE
 // ===============================
 app.post('/api/vacantes', (req, res) => {
-  const { nombre, area, requisitor, tipoProceso, tipo, prioridad, fecha, comentarios, estatus } = req.body;
+  const { nombre, area, requisitor, tipoProceso, tipo, prioridad, comentarios } = req.body;
 
-  const sql = `
-    INSERT INTO vacantes (nombre, area, requisitor, tipoProceso, tipo, prioridad, fecha, comentarios, estatus)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  // estatus inicial (mantiene compatibilidad)
+  const estatus = 'Cargar Descripción de Puesto';
+  // fechaInicio se fija automáticamente hoy
+  const fechaInicio = hoyISODate();
+
+  // Insertamos primero sin folio para recuperar el id
+  const sqlInsert = `
+    INSERT INTO vacantes (nombre, area, requisitor, tipoProceso, tipo, prioridad, fecha, comentarios, estatus, fechaInicio)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `;
-
-  db.run(sql, [nombre, area, requisitor, tipoProceso, tipo, prioridad, fecha, comentarios, estatus], function (err) {
+  db.run(sqlInsert, [
+    nombre || '',
+    area || '',
+    requisitor || '',
+    tipoProceso || '',
+    tipo || '',
+    prioridad || '',
+    null,                  // 'fecha' antiguo, ya no lo usamos, lo dejamos null
+    comentarios || '',
+    estatus,
+    fechaInicio
+  ], function (err) {
     if (err) {
       console.error('❌ Error al guardar la vacante:', err.message);
       return res.status(500).json({ error: 'Error al guardar la vacante' });
     }
-    console.log(`✅ Vacante guardada con ID ${this.lastID}`);
-    res.json({ id: this.lastID });
+
+    const id = this.lastID;
+    const folio = `PL-${hoyYYYYMMDD()}-${pad4(id)}`;
+
+    // Actualizamos el folio en la fila recién creada
+    db.run(`UPDATE vacantes SET folio = ? WHERE id = ?`, [folio, id], function (err2) {
+      if (err2) {
+        console.error('❌ Error al actualizar folio:', err2.message);
+        // Aun así devolvemos el id para no romper el flujo
+        return res.json({ id, folio: null, fechaInicio });
+      }
+      console.log(`✅ Vacante guardada con ID ${id} y folio ${folio}`);
+      res.json({ id, folio, fechaInicio });
+    });
   });
 });
 
@@ -85,15 +163,15 @@ app.post('/api/vacantes', (req, res) => {
 // ===============================
 app.put('/api/vacantes/:id', (req, res) => {
   const { id } = req.params;
-  const { nombre, area, requisitor, tipoProceso, tipo, prioridad, fecha, comentarios, estatus } = req.body;
+  const { nombre, area, requisitor, tipoProceso, tipo, prioridad, comentarios, estatus } = req.body;
 
   const sql = `
     UPDATE vacantes
-    SET nombre = ?, area = ?, requisitor = ?, tipoProceso = ?, tipo = ?, prioridad = ?, fecha = ?, comentarios = ?, estatus = ?
+    SET nombre = ?, area = ?, requisitor = ?, tipoProceso = ?, tipo = ?, prioridad = ?, comentarios = ?, estatus = ?
     WHERE id = ?
   `;
 
-  db.run(sql, [nombre, area, requisitor, tipoProceso, tipo, prioridad, fecha, comentarios, estatus, id], function (err) {
+  db.run(sql, [nombre, area, requisitor, tipoProceso, tipo, prioridad, comentarios, estatus, id], function (err) {
     if (err) {
       console.error('❌ Error al actualizar la vacante:', err.message);
       return res.status(500).json({ error: 'Error al actualizar la vacante' });
@@ -127,15 +205,8 @@ app.delete('/api/vacantes/:id', (req, res) => {
 });
 
 // ===============================
-// 🏠 RUTA RAÍZ
-// ===============================
-app.get('/', (req, res) => {
-  res.send('✅ Servidor PlayLearn Backend activo y funcionando');
-});
-
-// ===============================
 // 🚀 INICIAR SERVIDOR
 // ===============================
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor corriendo en el puerto ${PORT}`);
+  console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`);
 });
