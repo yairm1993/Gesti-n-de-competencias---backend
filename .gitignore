@@ -1,0 +1,9 @@
+# Ignorar dependencias
+node_modules
+
+# Ignorar base de datos local (opcional si no quieres subirla)
+database.db
+
+# Ignorar archivos temporales
+.env
+.DS_Store
